@@ -7,6 +7,8 @@ mihomo does not implement.
   `ReClash/core/extensions/testdata/protocol.json`; the SDK tests fail when the two differ.
 - `openflux/` — the OpenFlux wrapper (GPL-3.0-or-later, like upstream). Build and test it with `openflux/build.sh`,
   see `openflux/README.md`.
+- `qwdtt/` — the qWDTT (WireGuard over VK Calls TURN) wrapper (GPL-3.0-or-later, like upstream). Build and test it
+  with `qwdtt/build.sh`, see `qwdtt/README.md`.
 
 The protocol is described in `ReClash/project/_new/design/extensions/SPEC.md` §3.
 

@@ -1,0 +1,42 @@
+--- a/go_client/main.go
++++ b/go_client/main.go
+@@ -106,7 +106,7 @@
+ 	return message
+ }
+ 
+-func main() {
++func clientMain() {
+ 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+ 
+ 	ctx, cancel := context.WithCancel(context.Background())
+--- a/go_client/session.go
++++ b/go_client/session.go
+@@ -132,7 +132,7 @@
+ // TURN-relay душится/дропается, а TCP до того же relay проходит — сравни
+ // github.com/anton48/vk-turn-proxy-ios, который к той же VK/OK TURN-инфре
+ // (calls.okcdn.ru) по умолчанию ходит именно через TCP.
+-func dialTURNConn(turnAddr string, tcp bool) (net.PacketConn, io.Closer, error) {
++func directDialTURNConn(turnAddr string, tcp bool) (net.PacketConn, io.Closer, error) {
+ 	if !tcp {
+ 		resolved, err := net.ResolveUDPAddr("udp", turnAddr)
+ 		if err != nil {
+--- a/go_client/creds.go
++++ b/go_client/creds.go
+@@ -381,6 +381,7 @@
+ 		tlsclient.WithTimeoutSeconds(20),
+ 		tlsclient.WithClientProfile(profiles.Chrome_146),
+ 		tlsclient.WithCookieJar(jar),
++		tlsclient.WithDialContext(egressDialContext),
+ 	)
+ 	if err != nil {
+ 		return "", "", nil, fmt.Errorf("failed to initialize tls_client: %w", err)
+--- a/go_client/creds_vkcalls.go
++++ b/go_client/creds_vkcalls.go
+@@ -142,6 +142,7 @@
+ 		tlsclient.WithTimeoutSeconds(20),
+ 		tlsclient.WithClientProfile(profiles.Chrome_146),
+ 		tlsclient.WithCookieJar(tlsclient.NewCookieJar()),
++		tlsclient.WithDialContext(egressDialContext),
+ 	)
+ 	if err != nil {
+ 		return "", "", nil, newVKCallsFailure("setup", vkCallsFailureSetup, fmt.Errorf("create tls client: %w", err))
