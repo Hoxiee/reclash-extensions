@@ -9,6 +9,8 @@ mihomo does not implement.
   see `openflux/README.md`.
 - `qwdtt/` — the qWDTT (WireGuard over VK Calls TURN) wrapper (GPL-3.0-or-later, like upstream). Build and test it
   with `qwdtt/build.sh`, see `qwdtt/README.md`.
+- `naive/` — the NaiveProxy client (MIT; a reimplementation, no upstream code). Build and test it with
+  `naive/build.sh`, see `naive/README.md`.
 
 The protocol is described in `ReClash/project/_new/design/extensions/SPEC.md` §3.
 
