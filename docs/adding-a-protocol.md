@@ -2,8 +2,8 @@
 
 This guide takes a protocol from "a subscription has links ReClash cannot import" to a node that carries traffic.
 The contract itself (`reclash-ext/1`, the supervisor, packaging) is specified in
-`ReClash/project/_new/design/extensions/SPEC.md`; this page is the working procedure. `openflux/`, `qwdtt/` and
-`naive/` are the reference wrappers, and every rule below is one of them already follows.
+`ReClash/project/_new/design/extensions/SPEC.md`; this page is the working procedure. `openflux/`, `qwdtt/`,
+`naive/` and `olcrtc/` are the reference wrappers, and every rule below is one of them already follows.
 
 ## 1. Decide whether it needs an extension
 
@@ -181,7 +181,9 @@ entry so import recognises the scheme and the UI names the protocol:
 
 - `ReClash/lib/subscriptions/imports/subscription/extension_catalog.dart`: add
   `ExtensionEntry(id: '<id>', name: '<Display name>', schemes: ['<scheme>'])`. `name` is what proxy cards and editors
-  show as the node's type, and what unnamed nodes are numbered after (`<Display name> 1`).
+  show as the node's type, and what unnamed nodes are numbered after (`<Display name> 1`). Import names a node after
+  the link's `#` fragment; when the fragment is not a name (olcRTC keeps its key there), pass `nameOf`, or the node
+  is named after a secret.
 - `ReClash/test/subscriptions/share_link_compatibility_test.dart`, group `extension links`: one test that a line of
   the scheme imports as an extension node with the right `extension` and `link` (synthetic link).
 - Run `flutter analyze --no-fatal-infos` and that test file. No website page changes yet; the site documents
