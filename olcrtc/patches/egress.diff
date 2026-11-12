@@ -1,0 +1,546 @@
+--- /dev/null
++++ b/internal/client/dial.go
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: WTFPL
++
++package client
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++
++	"github.com/openlibrecommunity/olcrtc/internal/crypto"
++	"github.com/openlibrecommunity/olcrtc/internal/runtime"
++	"github.com/openlibrecommunity/olcrtc/internal/tunnelcore"
++)
++
++// ErrClientStopped is returned by a Dialer whose client has stopped.
++var ErrClientStopped = errors.New("client stopped")
++
++// ErrConfig marks a RunDialer failure no retry can cure: a bad key or an unusable device id file.
++var ErrConfig = errors.New("invalid client configuration")
++
++// Dialer opens tunnel streams to targets the server connects to.
++type Dialer interface {
++	Dial(ctx context.Context, host string, port int) (net.Conn, error)
++}
++
++type streamDialer struct {
++	c    *Client
++	done <-chan struct{}
++}
++
++// RunDialer is RunWithAddress without the SOCKS listener: once the link is up, onReady gets a Dialer that opens
++// streams directly. It blocks until ctx is canceled or the link ends.
++func RunDialer(ctx context.Context, cfg Config, onReady func(Dialer)) error {
++	runCtx, cancel := context.WithCancel(ctx)
++	defer cancel()
++	keys, err := tunnelcore.SetupKeySet(cfg.KeyHex, crypto.Client)
++	if err != nil {
++		return fmt.Errorf("%w: setup key set: %w", ErrConfig, err)
++	}
++	deviceID, err := resolveDeviceID(cfg.DeviceID, cfg.DeviceIDPath)
++	if err != nil {
++		return fmt.Errorf("%w: resolve device id: %w", ErrConfig, err)
++	}
++	client := &Client{
++		keys: keys, deviceID: deviceID, claims: cfg.Claims, dnsServer: cfg.DNSServer,
++		health: runtime.NewHealthTracker(cfg.OnHealth), sessionReady: make(chan struct{}),
++	}
++	defer func() {
++		cancel()
++		client.shutdown()
++	}()
++	if bringUpErr := client.bringUpLink(runCtx, cfg, cancel); bringUpErr != nil {
++		return bringUpErr
++	}
++	if onReady != nil {
++		onReady(streamDialer{c: client, done: runCtx.Done()})
++	}
++	<-runCtx.Done()
++	return nil
++}
++
++// Dial waits for a live session like handleSocks5 and sends the same connect request; the returned stream carries
++// the target's bytes.
++func (d streamDialer) Dial(ctx context.Context, host string, port int) (net.Conn, error) {
++	for {
++		session, sessionID, ready := d.c.sessionSnapshot()
++		if session != nil && !session.IsClosed() && sessionID != "" {
++			stream, err := session.OpenStream()
++			if err != nil {
++				return nil, fmt.Errorf("open stream: %w", err)
++			}
++			if err := d.c.sendConnectRequest(stream, host, port); err != nil {
++				_ = stream.Close()
++				return nil, err
++			}
++			return stream, nil
++		}
++		select {
++		case <-ctx.Done():
++			return nil, fmt.Errorf("wait for session: %w", ctx.Err())
++		case <-d.done:
++			return nil, ErrClientStopped
++		case <-ready:
++		}
++	}
++}
+--- /dev/null
++++ b/internal/engine/pion_egress.go
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: WTFPL
++
++package engine
++
++import (
++	"net"
++
++	"github.com/pion/ice/v4"
++	"github.com/pion/transport/v4"
++	"github.com/pion/webrtc/v4"
++
++	"github.com/openlibrecommunity/olcrtc/internal/protect"
++)
++
++// egressPionSettings applies the egress Net to every engine. ICE stays on UDP4: pion's active ICE-TCP binds and
++// dials with the net package directly, past SetNet. TURN over TCP still goes through the ICE proxy dialer.
++func egressPionSettings(opts PionSettingsOptions, egressNet transport.Net) PionSettings {
++	return func(settings *webrtc.SettingEngine) {
++		if opts.LoggerFactory != nil {
++			settings.LoggerFactory = opts.LoggerFactory
++		}
++		settings.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
++		settings.SetIPFilter(func(ip net.IP) bool { return ip.To4() != nil })
++		settings.SetNet(egressNet)
++		settings.SetICEProxyDialer(protect.NewProxyDialer())
++		settings.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
++	}
++}
+--- a/internal/engine/pion.go
++++ b/internal/engine/pion.go
+@@ -26,6 +26,9 @@
+ 
+ // NewPionSettings prepares protected networking and per-engine pion settings.
+ func NewPionSettings(opts PionSettingsOptions) (PionSettings, error) {
++	if egressNet := protect.NewEgressNet(); egressNet != nil {
++		return egressPionSettings(opts, egressNet), nil
++	}
+ 	useProtectedNet := protect.HasProtector() || opts.Resolver != nil || runtime.GOOS == "android"
+ 	var protectedNet *protect.ProtectedNet
+ 	if useProtectedNet {
+--- /dev/null
++++ b/internal/protect/egress.go
+@@ -0,0 +1,308 @@
++// SPDX-License-Identifier: WTFPL
++
++package protect
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"strings"
++	"sync/atomic"
++	"time"
++
++	"github.com/gorilla/websocket"
++	"github.com/pion/transport/v4"
++)
++
++// Egress replaces every socket of the client with one opened by the embedding host: HTTP, WebSocket, ICE, STUN,
++// TURN and DNS. Dial takes host names unresolved; Resolver answers the names pion has to turn into addresses.
++type Egress struct {
++	Dial         func(ctx context.Context, network, address string) (net.Conn, error)
++	ListenPacket func(ctx context.Context) (net.PacketConn, error)
++	Resolver     *net.Resolver
++}
++
++//nolint:gochecknoglobals // like the protector, the egress covers every socket of the process
++var egress atomic.Pointer[Egress]
++
++// ErrEgressListen is returned for sockets an egress cannot open: TCP listeners and IPv6 UDP.
++var ErrEgressListen = errors.New("protect: listening is not available through the egress")
++
++// SetEgress routes every client socket through e; nil restores direct sockets.
++func SetEgress(e *Egress) {
++	egress.Store(e)
++}
++
++// HasEgress reports whether an egress is configured.
++func HasEgress() bool {
++	return egress.Load() != nil
++}
++
++func egressTransport(t *http.Transport) *http.Transport {
++	if e := egress.Load(); e != nil {
++		t.Proxy = nil
++		t.DialContext = e.Dial
++	}
++	return t
++}
++
++func egressWebSocket(d websocket.Dialer) websocket.Dialer {
++	if e := egress.Load(); e != nil {
++		d.Proxy = nil
++		d.NetDialContext = e.Dial
++	}
++	return d
++}
++
++// egressIfaceAddr is the address pion announces for host candidates. The egress owns the real local address, so
++// the peer reaches this one only as the peer-reflexive address it observes.
++//
++//nolint:gochecknoglobals // fixed placeholder (TEST-NET-1)
++var egressIfaceAddr = net.IPv4(192, 0, 2, 1).To4()
++
++// NewEgressNet returns pion's Net over the configured egress, or nil when there is none.
++func NewEgressNet() transport.Net {
++	e := egress.Load()
++	if e == nil {
++		return nil
++	}
++	return &egressNet{ProtectedNet: &ProtectedNet{resolver: e.Resolver}, e: e}
++}
++
++// egressNet keeps ProtectedNet only for name resolution, which goes to the egress resolver; every method that opens
++// a socket is overridden.
++type egressNet struct {
++	*ProtectedNet
++	e *Egress
++}
++
++func (n *egressNet) Interfaces() ([]*transport.Interface, error) {
++	ifc := transport.NewInterface(net.Interface{
++		Index: 1, MTU: 1500, Name: "egress0", Flags: net.FlagUp | net.FlagRunning,
++	})
++	ifc.AddAddress(&net.IPNet{IP: egressIfaceAddr, Mask: net.CIDRMask(32, 32)})
++	return []*transport.Interface{ifc}, nil
++}
++
++func (n *egressNet) InterfaceByIndex(index int) (*transport.Interface, error) {
++	ifcs, _ := n.Interfaces()
++	if index == ifcs[0].Index {
++		return ifcs[0], nil
++	}
++	return nil, fmt.Errorf("%w: index=%d", transport.ErrInterfaceNotFound, index)
++}
++
++func (n *egressNet) InterfaceByName(name string) (*transport.Interface, error) {
++	ifcs, _ := n.Interfaces()
++	if name == ifcs[0].Name {
++		return ifcs[0], nil
++	}
++	return nil, fmt.Errorf("%w: %s", transport.ErrInterfaceNotFound, name)
++}
++
++func (n *egressNet) ListenPacket(network, address string) (net.PacketConn, error) {
++	var local *net.UDPAddr
++	if host, _, err := net.SplitHostPort(address); err == nil {
++		local = &net.UDPAddr{IP: net.ParseIP(host)}
++	}
++	return n.listenUDP(network, local)
++}
++
++func (n *egressNet) ListenUDP(network string, locAddr *net.UDPAddr) (transport.UDPConn, error) {
++	return n.listenUDP(network, locAddr)
++}
++
++func (n *egressNet) listenUDP(network string, locAddr *net.UDPAddr) (*egressUDPConn, error) {
++	if network != "udp" && network != "udp4" {
++		return nil, fmt.Errorf("%w: %s", ErrEgressListen, network)
++	}
++	pc, err := n.e.ListenPacket(context.Background())
++	if err != nil {
++		return nil, fmt.Errorf("egress listen udp: %w", err)
++	}
++	return newEgressUDPConn(pc, locAddr, nil), nil
++}
++
++func (n *egressNet) ListenTCP(network string, _ *net.TCPAddr) (transport.TCPListener, error) {
++	return nil, fmt.Errorf("%w: %s", ErrEgressListen, network)
++}
++
++func (n *egressNet) Dial(network, address string) (net.Conn, error) {
++	return n.dial(context.Background(), network, address)
++}
++
++func (n *egressNet) dial(ctx context.Context, network, address string) (net.Conn, error) {
++	conn, err := n.e.Dial(ctx, network, address)
++	if err != nil {
++		return nil, fmt.Errorf("egress dial %s %q: %w", network, address, err)
++	}
++	if !strings.HasPrefix(network, "udp") {
++		return conn, nil
++	}
++	pc, ok := conn.(net.PacketConn)
++	if !ok {
++		_ = conn.Close()
++		return nil, ErrUnexpectedConnType
++	}
++	return newEgressUDPConn(pc, nil, conn.RemoteAddr()), nil
++}
++
++func (n *egressNet) DialUDP(network string, _, raddr *net.UDPAddr) (transport.UDPConn, error) {
++	conn, err := n.dial(context.Background(), network, udpAddrString(raddr))
++	if err != nil {
++		return nil, err
++	}
++	return conn.(*egressUDPConn), nil //nolint:forcetypeassert // dial wraps every udp conn
++}
++
++func (n *egressNet) DialTCP(network string, _, raddr *net.TCPAddr) (transport.TCPConn, error) {
++	conn, err := n.dial(context.Background(), network, tcpAddrString(raddr))
++	if err != nil {
++		return nil, err
++	}
++	return egressTCPConn{conn}, nil
++}
++
++func (n *egressNet) CreateDialer(d *net.Dialer) transport.Dialer {
++	timeout := time.Duration(0)
++	if d != nil {
++		timeout = d.Timeout
++	}
++	return egressDialer{n: n, timeout: timeout}
++}
++
++func (n *egressNet) CreateListenConfig(*net.ListenConfig) transport.ListenConfig {
++	return egressListenConfig{n: n}
++}
++
++type egressDialer struct {
++	n       *egressNet
++	timeout time.Duration
++}
++
++func (d egressDialer) Dial(network, address string) (net.Conn, error) {
++	ctx := context.Background()
++	if d.timeout > 0 {
++		var cancel context.CancelFunc
++		ctx, cancel = context.WithTimeout(ctx, d.timeout)
++		defer cancel()
++	}
++	return d.n.dial(ctx, network, address)
++}
++
++type egressListenConfig struct {
++	n *egressNet
++}
++
++func (l egressListenConfig) Listen(_ context.Context, network, _ string) (net.Listener, error) {
++	return nil, fmt.Errorf("%w: %s", ErrEgressListen, network)
++}
++
++func (l egressListenConfig) ListenPacket(_ context.Context, network, address string) (net.PacketConn, error) {
++	return l.n.ListenPacket(network, address)
++}
++
++// egressUDPConn adapts an egress packet conn to pion's UDPConn. The local address keeps the bind IP pion asked for
++// with the egress socket's port, since pion builds host candidates from it.
++type egressUDPConn struct {
++	net.PacketConn
++	local  *net.UDPAddr
++	remote net.Addr
++}
++
++func newEgressUDPConn(pc net.PacketConn, bind *net.UDPAddr, remote net.Addr) *egressUDPConn {
++	local := &net.UDPAddr{IP: egressIfaceAddr}
++	if bind != nil && bind.IP != nil && !bind.IP.IsUnspecified() {
++		local.IP = bind.IP
++	}
++	if a, ok := pc.LocalAddr().(*net.UDPAddr); ok {
++		local.Port = a.Port
++	}
++	return &egressUDPConn{PacketConn: pc, local: local, remote: remote}
++}
++
++func (c *egressUDPConn) LocalAddr() net.Addr { return c.local }
++
++func (c *egressUDPConn) RemoteAddr() net.Addr { return c.remote }
++
++func (c *egressUDPConn) SetReadBuffer(int) error { return nil }
++
++func (c *egressUDPConn) SetWriteBuffer(int) error { return nil }
++
++func (c *egressUDPConn) Read(b []byte) (int, error) {
++	n, _, err := c.ReadFrom(b)
++	return n, err
++}
++
++func (c *egressUDPConn) ReadFrom(b []byte) (int, net.Addr, error) {
++	n, addr, err := c.PacketConn.ReadFrom(b)
++	if ua, ok := addr.(*net.UDPAddr); ok {
++		if ip4 := ua.IP.To4(); ip4 != nil {
++			addr = &net.UDPAddr{IP: ip4, Port: ua.Port}
++		}
++	}
++	return n, addr, err //nolint:wrapcheck // pion inspects net errors from its socket
++}
++
++func (c *egressUDPConn) ReadFromUDP(b []byte) (int, *net.UDPAddr, error) {
++	n, addr, err := c.ReadFrom(b)
++	ua, _ := addr.(*net.UDPAddr)
++	return n, ua, err
++}
++
++func (c *egressUDPConn) ReadMsgUDP(b, _ []byte) (int, int, int, *net.UDPAddr, error) {
++	n, addr, err := c.ReadFromUDP(b)
++	return n, 0, 0, addr, err
++}
++
++func (c *egressUDPConn) Write(b []byte) (int, error) {
++	if c.remote == nil {
++		return 0, &net.OpError{Op: "write", Net: "udp", Err: errors.New("not connected")}
++	}
++	return c.WriteTo(b, c.remote)
++}
++
++func (c *egressUDPConn) WriteToUDP(b []byte, addr *net.UDPAddr) (int, error) {
++	return c.WriteTo(b, addr)
++}
++
++func (c *egressUDPConn) WriteMsgUDP(b, _ []byte, addr *net.UDPAddr) (int, int, error) {
++	n, err := c.WriteTo(b, addr)
++	return n, 0, err
++}
++
++// egressTCPConn gives an egress stream the TCPConn surface pion asks for TURN over TCP; socket options have no
++// socket to apply to.
++type egressTCPConn struct {
++	net.Conn
++}
++
++func (c egressTCPConn) CloseRead() error { return nil }
++
++func (c egressTCPConn) CloseWrite() error {
++	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
++		return cw.CloseWrite() //nolint:wrapcheck // passthrough
++	}
++	return c.Conn.Close() //nolint:wrapcheck // passthrough
++}
++
++func (c egressTCPConn) ReadFrom(r io.Reader) (int64, error) {
++	return io.Copy(struct{ io.Writer }{c.Conn}, r) //nolint:wrapcheck // passthrough
++}
++
++func (c egressTCPConn) SetLinger(int) error { return nil }
++
++func (c egressTCPConn) SetKeepAlive(bool) error { return nil }
++
++func (c egressTCPConn) SetKeepAlivePeriod(time.Duration) error { return nil }
++
++func (c egressTCPConn) SetNoDelay(bool) error { return nil }
++
++func (c egressTCPConn) SetWriteBuffer(int) error { return nil }
++
++func (c egressTCPConn) SetReadBuffer(int) error { return nil }
++
++var _ transport.Net = (*egressNet)(nil)
+--- a/internal/protect/protect.go
++++ b/internal/protect/protect.go
+@@ -93,6 +93,9 @@
+ 
+ // NewResolver returns a local Go resolver that sends queries to dnsServer.
+ func NewResolver(dnsServer string) *net.Resolver {
++	if e := egress.Load(); e != nil {
++		return e.Resolver
++	}
+ 	if dnsServer == "" {
+ 		return nil
+ 	}
+@@ -113,7 +116,7 @@
+ // newHTTPTransport returns an HTTP transport using protected sockets and sane timeouts.
+ func newHTTPTransport(resolvers ...*net.Resolver) *http.Transport {
+ 	dialer := newDialerWithResolver(firstResolver(resolvers))
+-	return &http.Transport{
++	return egressTransport(&http.Transport{
+ 		Proxy:                 http.ProxyFromEnvironment,
+ 		DialContext:           dialer.DialContext,
+ 		TLSClientConfig:       newTLSConfig(),
+@@ -122,7 +125,7 @@
+ 		IdleConnTimeout:       defaultIdleConnTimeout,
+ 		TLSHandshakeTimeout:   defaultTLSHandshake,
+ 		ResponseHeaderTimeout: defaultResponseHeader,
+-	}
++	})
+ }
+ 
+ // NewHTTPClient returns an http.Client using protected sockets with DNS retry.
+@@ -220,12 +223,12 @@
+ 	if handshakeTimeout <= 0 {
+ 		handshakeTimeout = defaultWebSocketTimeout
+ 	}
+-	return websocket.Dialer{
++	return egressWebSocket(websocket.Dialer{
+ 		NetDialContext:   newDialerWithResolver(firstResolver(resolvers)).DialContext,
+ 		Proxy:            http.ProxyFromEnvironment,
+ 		TLSClientConfig:  newTLSConfig(),
+ 		HandshakeTimeout: handshakeTimeout,
+-	}
++	})
+ }
+ 
+ // StatusError formats an upstream HTTP error while bounding and redacting the body.
+@@ -254,6 +257,9 @@
+ 
+ // Dial connects to the address on the named network using a protected socket.
+ func (d *ProxyDialer) Dial(network, addr string) (net.Conn, error) {
++	if e := egress.Load(); e != nil {
++		return e.Dial(context.Background(), network, addr)
++	}
+ 	conn, err := newDialerWithResolver(d.resolver).Dial(network, addr)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("dial failed: %w", err)
+--- /dev/null
++++ b/pkg/olcrtc/client/egress.go
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: WTFPL
++
++package client
++
++import (
++	"context"
++	"fmt"
++
++	internalclient "github.com/openlibrecommunity/olcrtc/internal/client"
++	"github.com/openlibrecommunity/olcrtc/internal/logger"
++	"github.com/openlibrecommunity/olcrtc/internal/protect"
++)
++
++// Egress is the host-provided network every client socket uses.
++type Egress = protect.Egress
++
++// Dialer opens tunnel streams on the established session.
++type Dialer = internalclient.Dialer
++
++// ErrClientStopped is returned by a Dialer whose client has stopped.
++var ErrClientStopped = internalclient.ErrClientStopped
++
++// ErrConfig marks a RunDialer failure no retry can cure.
++var ErrConfig = internalclient.ErrConfig
++
++// SetEgress routes every socket of the process through e (signalling, ICE, STUN, TURN, DNS); nil restores direct
++// sockets. Set it before New.
++func SetEgress(e *Egress) {
++	protect.SetEgress(e)
++}
++
++// SetVerbose enables upstream debug logging.
++func SetVerbose(enabled bool) {
++	logger.SetVerbose(enabled)
++}
++
++// RunDialer starts the client without a SOCKS listener and hands onReady a Dialer once the link is up. It blocks
++// until ctx is canceled or the provider ends; LocalAddr and the SOCKS credentials are ignored.
++func (c *Client) RunDialer(ctx context.Context, onReady func(Dialer)) error {
++	if err := internalclient.RunDialer(ctx, toClientConfig(c.cfg), onReady); err != nil {
++		return fmt.Errorf("client: %w", err)
++	}
++	return nil
++}
